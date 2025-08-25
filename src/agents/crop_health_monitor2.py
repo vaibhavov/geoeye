@@ -6,13 +6,18 @@ Orchestrates data collection, analysis, and reporting using LangGraph
 import os
 import time
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, TypedDict, Literal
 from dataclasses import dataclass
 
-# LangGraph and LLM
+# LangGraph and LLM - Updated import
 from langgraph.graph import StateGraph, END
-from langchain_community.chat_models import ChatOllama
+try:
+    from langchain_ollama import ChatOllama  # Updated import
+except ImportError:
+    # Fallback to old import if new package not available
+    from langchain_community.chat_models import ChatOllama
 
 # Our custom modules
 from data_agent import collect_field_data, DataResponse
@@ -44,7 +49,7 @@ class CropHealthState(TypedDict):
     health_score: int
     status: str  # 'running', 'completed', 'error'
 
-    # Report fields (ADD THESE)
+    # Report fields
     health_status: Optional[str]
     status_emoji: Optional[str]
     ndvi_mean: Optional[float]
@@ -68,14 +73,17 @@ llm_brain = ChatOllama(
     model="mistral-nemo", 
     base_url="http://localhost:11434",
     temperature=0.1,
-    model_kwargs={"num_ctx": 4096, "num_predict": 512}
+    # Updated parameters for newer version
+    num_ctx=4096,
+    num_predict=512
 )
 
 # Planner LLM for orchestration
 llm_planner = ChatOllama(
     model="mistral-nemo",
     base_url="http://localhost:11434", 
-    temperature=0
+    temperature=0,
+    num_ctx=4096
 )
 
 # =========================
@@ -252,43 +260,60 @@ You are an expert agronomist analyzing crop health data. Based on the analysis r
 FIELD DATA:
 {json.dumps(context, indent=2, default=str)}
 
-Return a JSON object with this exact structure:
+Please provide a response in valid JSON format with this exact structure:
 {{
   "issues": [
     {{
-      "type": "water|nutrient|disease|pest|general",
-      "severity": 1-5,
-      "confidence": 0.0-1.0,
-      "description": "brief description",
+      "type": "water",
+      "severity": 3,
+      "confidence": 0.8,
+      "description": "brief description of the issue",
       "evidence": ["evidence1", "evidence2"]
     }}
   ],
   "recommendations": [
     {{
-      "type": "irrigation|fertilizer|pesticide|monitoring|management",
-      "priority": "critical|high|medium|low",
+      "type": "irrigation", 
+      "priority": "high",
       "action": "specific action to take",
-      "timing": "immediate|this_week|next_week|seasonal",
-      "cost_estimate": "low|medium|high",
+      "timing": "this_week",
+      "cost_estimate": "medium",
       "expected_benefit": "brief benefit description"
     }}
   ],
   "confidence_scores": {{
-    "overall_analysis": 0.0-1.0,
-    "vegetation_health": 0.0-1.0,
-    "stress_detection": 0.0-1.0
+    "overall_analysis": 0.85,
+    "vegetation_health": 0.9,
+    "stress_detection": 0.7
   }}
 }}
 
-Focus on actionable, specific recommendations based on the data evidence.
+Important: 
+- Only return valid JSON, no other text
+- Use only these types: water, nutrient, disease, pest, general
+- Use only these priorities: critical, high, medium, low
+- Use only these timings: immediate, this_week, next_week, seasonal
+- Use only these cost estimates: low, medium, high
+- Severity should be 1-5
+- Confidence should be 0.0-1.0
 """
 
         # Get LLM response
-        response = llm_brain.invoke([{"role": "user", "content": brain_prompt}])
+        response = llm_brain.invoke(brain_prompt)
         
         try:
+            # Clean the response content - remove any non-JSON text
+            content = response.content.strip()
+            
+            # Try to extract JSON from response
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+            else:
+                json_str = content
+            
             # Parse LLM response
-            brain_output = json.loads(response.content)
+            brain_output = json.loads(json_str)
             
             state['issues'] = brain_output.get('issues', [])
             state['recommendations'] = brain_output.get('recommendations', [])
@@ -296,8 +321,9 @@ Focus on actionable, specific recommendations based on the data evidence.
             
             print(f"✅ AI analysis: {len(state['issues'])} issues, {len(state['recommendations'])} recommendations")
             
-        except json.JSONDecodeError:
-            print("⚠️ LLM response parsing failed, using fallback analysis")
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"⚠️ LLM response parsing failed ({str(e)}), using fallback analysis")
+            print(f"LLM Response: {response.content[:200]}...")  # Debug output
             state['issues'], state['recommendations'], state['confidence_scores'] = _fallback_analysis(state)
             
     except Exception as e:
@@ -352,7 +378,7 @@ def supervisor_node(state: CropHealthState) -> CropHealthState:
     # Confidence threshold enforcement
     low_confidence_items = [
         k for k, v in state['confidence_scores'].items() 
-        if v < 0.5
+        if isinstance(v, (int, float)) and v < 0.5
     ]
     
     if low_confidence_items:
@@ -405,7 +431,7 @@ def report_generation_node(state: CropHealthState) -> CropHealthState:
         state['processing_time'] = processing_time
         state['status'] = 'completed'
         
-        # Store report data directly in state (avoiding TypedDict limitations)
+        # Store report data directly in state
         state['health_status'] = health_status
         state['status_emoji'] = status_emoji
         state['ndvi_mean'] = round(ndvi_mean, 3)
@@ -436,6 +462,8 @@ def _fallback_analysis(state: CropHealthState) -> tuple:
     
     # Basic rule-based analysis
     sat_data = state['analysis_results'].get('compute_indices', {})
+    
+    # Check NDVI values
     if isinstance(sat_data.get('NDVI'), dict):
         ndvi = sat_data['NDVI'].get('mean', 0)
         
@@ -451,10 +479,49 @@ def _fallback_analysis(state: CropHealthState) -> tuple:
             recommendations.append({
                 'type': 'monitoring',
                 'priority': 'high',
-                'action': 'Field inspection recommended',
+                'action': 'Conduct field inspection to identify stress causes',
                 'timing': 'this_week',
                 'cost_estimate': 'low',
-                'expected_benefit': 'Identify stress causes'
+                'expected_benefit': 'Identify and address stress factors'
+            })
+        elif ndvi < 0.6:
+            issues.append({
+                'type': 'general',
+                'severity': 2,
+                'confidence': 0.7,
+                'description': 'Moderate vegetation vigor detected',
+                'evidence': [f'NDVI = {ndvi:.3f}']
+            })
+            
+            recommendations.append({
+                'type': 'monitoring',
+                'priority': 'medium',
+                'action': 'Monitor crop development closely',
+                'timing': 'next_week',
+                'cost_estimate': 'low',
+                'expected_benefit': 'Early detection of potential issues'
+            })
+    
+    # Check weather-based stress
+    weather_data = state['analysis_results'].get('weather', {})
+    if isinstance(weather_data, dict) and 'precipitation' in weather_data:
+        recent_precip = weather_data.get('precipitation_7day', 0)
+        if recent_precip < 10:  # Less than 10mm in 7 days
+            issues.append({
+                'type': 'water',
+                'severity': 3,
+                'confidence': 0.8,
+                'description': 'Low recent precipitation detected',
+                'evidence': [f'7-day precipitation: {recent_precip}mm']
+            })
+            
+            recommendations.append({
+                'type': 'irrigation',
+                'priority': 'medium',
+                'action': 'Consider supplemental irrigation',
+                'timing': 'this_week',
+                'cost_estimate': 'medium',
+                'expected_benefit': 'Maintain adequate soil moisture'
             })
     
     return issues, recommendations, confidence
@@ -523,17 +590,6 @@ def analyze_field(field_id: str, crop: str, latitude: float, longitude: float,
                  das: int, radius_m: int = 1000) -> Dict[str, Any]:
     """
     Main function to analyze a field's health
-    
-    Args:
-        field_id: Unique field identifier
-        crop: Crop type ('corn', 'soybeans', etc.)
-        latitude: Field latitude
-        longitude: Field longitude
-        das: Days after sowing
-        radius_m: Analysis radius in meters
-        
-    Returns:
-        Complete analysis results
     """
     
     print(f"\n🌱 Starting Crop Health Analysis")
@@ -560,6 +616,14 @@ def analyze_field(field_id: str, crop: str, latitude: float, longitude: float,
         confidence_scores={},
         health_score=0,
         status='initialized',
+        # Add the new fields with defaults
+        health_status=None,
+        status_emoji=None,
+        ndvi_mean=None,
+        issues_found=None,
+        recommendations_count=None,
+        alerts_count=None,
+        tools_executed=None,
         started_at='',
         finished_at=None,
         processing_time=None,
@@ -575,17 +639,13 @@ def analyze_field(field_id: str, crop: str, latitude: float, longitude: float,
         
         # Print summary
         if final_state['status'] == 'completed':
-            summary = final_state.get('report_summary', {})
-            health = summary.get('health_summary', {})
-            metrics = summary.get('key_metrics', {})
-            
             print(f"\n🎉 Analysis Complete!")
             print(f"{'='*50}")
-            print(f"{result.get('status_emoji', '📊')} Health Status: {result.get('health_status', 'Unknown')} ({result.get('health_score', 0)}/100)")
-            print(f"📈 NDVI: {result.get('ndvi_mean', 'N/A')}")
-            print(f"⚠️  Issues Found: {result.get('issues_found', 0)}")
-            print(f"💡 Recommendations: {result.get('recommendations_count', 0)}")
-            print(f"⚡ Processing Time: {summary.get('processing_info', {}).get('processing_time_seconds', 0):.1f}s")
+            print(f"{final_state.get('status_emoji', '📊')} Health Status: {final_state.get('health_status', 'Unknown')} ({final_state.get('health_score', 0)}/100)")
+            print(f"📈 NDVI: {final_state.get('ndvi_mean', 'N/A')}")
+            print(f"⚠️  Issues Found: {final_state.get('issues_found', 0)}")
+            print(f"💡 Recommendations: {final_state.get('recommendations_count', 0)}")
+            print(f"⚡ Processing Time: {final_state.get('processing_time', 0):.1f}s")
             
             if final_state['errors']:
                 print(f"⚠️  Warnings: {len(final_state['errors'])}")
@@ -595,7 +655,8 @@ def analyze_field(field_id: str, crop: str, latitude: float, longitude: float,
     except Exception as e:
         print(f"\n❌ Analysis failed: {str(e)}")
         return {'error': str(e), 'status': 'failed'}
-
+    
+    
 if __name__ == "__main__":
     # Test the complete agent
     result = analyze_field(
